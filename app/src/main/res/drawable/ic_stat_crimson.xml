@@ -1,0 +1,16 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="72"
+    android:viewportHeight="72">
+    <!-- Status icons use the alpha mask; keep the launcher mark without its solid background. -->
+    <group android:translateX="-18" android:translateY="-16">
+        <path
+            android:fillColor="@android:color/transparent"
+            android:strokeColor="#FFFFFF"
+            android:strokeWidth="5"
+            android:strokeLineCap="square"
+            android:strokeLineJoin="miter"
+            android:pathData="M27,78 L55,25 L81,78 M36,64 L69,49" />
+    </group>
+</vector>

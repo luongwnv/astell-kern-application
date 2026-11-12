@@ -5,6 +5,8 @@ import android.app.Activity;
 import android.content.ContentUris;
 import android.content.ComponentName;
 import android.content.Intent;
+import android.content.ServiceConnection;
+import android.os.IBinder;
 import android.media.MediaMetadata;
 import android.media.session.MediaController;
 import android.media.session.MediaSessionManager;
@@ -31,6 +33,8 @@ import android.view.View;
 import android.view.WindowManager;
 import android.widget.*;
 import java.util.*;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 public class MainActivity extends Activity {
     private static final int BG=0xff111112, PANEL=0xff1c1c1e, LINE=0xff303033, RED=0xffb32d39, WHITE=0xffeeeeef, MUTED=0xff8e8e93;
@@ -39,20 +43,35 @@ public class MainActivity extends Activity {
     private final Handler handler=new Handler();
     private LinearLayout root, content, drawerPanel; private FrameLayout screen, drawerOverlay; private MediaPlayer player; private boolean playerReady=false; private int current=-1; private String category="SONGS", query=""; private boolean full=false, shuffle=false, repeat=false, dragging=false; private SeekBar seek; private TextView elapsed, duration;
     private final Random random=new Random();
+    private final SeekPositionTracker seekPosition=new SeekPositionTracker();
+    private final ExecutorService libraryWorker=Executors.newSingleThreadExecutor();
+    private int libraryGeneration;
+    private boolean resumedOnce;
     private final Runnable drawerTimeout=()->closeDrawer();
     private void resetDrawerTimeout(){handler.removeCallbacks(drawerTimeout);if(drawerOverlay!=null)handler.postDelayed(drawerTimeout,8000);}
     private boolean externalScreen=false, ampScreen=false, eqScreen=false, homeScreen=false, externalQueueOpen=false, drawerClosing=false;
     private DeviceEqualizer equalizer;
+    private SystemEqualizerService eqService;
+    private boolean eqBound;
+    private final ServiceConnection eqConnection=new ServiceConnection(){
+        @Override public void onServiceConnected(ComponentName name,IBinder binder){
+            eqService=((SystemEqualizerService.LocalBinder)binder).getService();
+            try{eqService.restoreIfEnabled();}catch(RuntimeException e){android.util.Log.w("CrimsonEQ","Could not start system EQ",e);}
+            equalizer=eqService.getEqualizer();
+            if(eqScreen)showEqualizer();
+        }
+        @Override public void onServiceDisconnected(ComponentName name){eqService=null;equalizer=null;if(eqScreen)showEqualizer();}
+    };
     private MediaController externalController, miniController;
     private TextView miniTitle; private PlayerIcon miniToggle;
     private final MediaController.Callback externalCallback=new MediaController.Callback(){
-        @Override public void onMetadataChanged(MediaMetadata metadata){if(externalScreen)renderExternal();}
-        @Override public void onPlaybackStateChanged(PlaybackState state){if(externalScreen)renderExternal();}
+        @Override public void onMetadataChanged(MediaMetadata metadata){if(externalScreen&&!dragging&&!seekPosition.isPending())renderExternal();}
+        @Override public void onPlaybackStateChanged(PlaybackState state){if(externalScreen){updatePlaybackProgress();if(!dragging&&!seekPosition.isPending())renderExternal();}}
         @Override public void onQueueChanged(List<MediaSession.QueueItem> items){if(externalScreen&&externalQueueOpen)showExternalQueue();}
         @Override public void onSessionDestroyed(){externalController=null;if(externalScreen)showExternal();}
     };
     static class Song { long id, albumId, duration; String title, artist, album; Uri uri; }
-    @Override public void onCreate(Bundle b) { super.onCreate(b); getWindow().setStatusBarColor(BG); getWindow().setNavigationBarColor(BG); favorites.addAll(getPreferences(0).getStringSet("favorites",new HashSet<>())); initializePlayer(); showLibrary(); requestLibrary(); handler.post(tick); }
+    @Override public void onCreate(Bundle b) { super.onCreate(b); getWindow().setStatusBarColor(BG); getWindow().setNavigationBarColor(BG); favorites.addAll(getPreferences(0).getStringSet("favorites",new HashSet<>())); eqBound=bindService(new Intent(this,SystemEqualizerService.class),eqConnection,BIND_AUTO_CREATE); showLibrary(); requestLibrary(); if(SystemEqualizerService.SHOW_EQ.equals(getIntent().getAction()))showEqualizer(); handler.post(tick); }
     private int dp(float n){return (int)(getResources().getDisplayMetrics().density*n+.5f);}
     private TextView text(String s,int size,int color){ TextView t=new TextView(this); t.setText(s); t.setTextSize(size); t.setTextColor(color); t.setGravity(Gravity.CENTER_VERTICAL); return t; }
     private TextView button(String s,int size,Runnable action){TextView t=text(s,size,WHITE); t.setGravity(Gravity.CENTER); t.setOnClickListener(v->action.run()); return t;}
@@ -65,8 +84,26 @@ public class MainActivity extends Activity {
     private void base(){handler.removeCallbacks(drawerTimeout);homeScreen=false;drawerClosing=false;miniController=null;miniTitle=null;miniToggle=null;drawerOverlay=null;drawerPanel=null;screen=new FrameLayout(this);screen.setFitsSystemWindows(true);LinearLayout shell=column();shell.setBackgroundColor(BG);root=column();root.setBackgroundColor(BG);shell.addView(root,new LinearLayout.LayoutParams(-1,0,1));LinearLayout navigation=row();navigation.setBackgroundColor(0xff202326);weighted(navigation,icon("home",true,this::showLibrary,"Library"));weighted(navigation,icon("playing",true,()->{if(externalScreen&&externalController!=null)renderExternal();else if(current>=0)showPlayer();else showExternal();},"Now playing"));weighted(navigation,icon("menu",true,this::showMenu,"Menu"));weighted(navigation,icon("back",true,this::onBackPressed,"Back"));add(shell,navigation,-1,48);screen.addView(shell,new FrameLayout.LayoutParams(-1,-1));setContentView(screen);}
     private void requestLibrary(){String permission=Build.VERSION.SDK_INT>=33?Manifest.permission.READ_MEDIA_AUDIO:Manifest.permission.READ_EXTERNAL_STORAGE; if(checkSelfPermission(permission)!=PackageManager.PERMISSION_GRANTED) requestPermissions(new String[]{permission},7); else loadSongs();}
     @Override public void onRequestPermissionsResult(int request,String[] permissions,int[] results){super.onRequestPermissionsResult(request,permissions,results);if(request==7){if(results.length>0&&results[0]==PackageManager.PERMISSION_GRANTED)loadSongs();else showLibrary();}}
-    private void loadSongs(){songs.clear();String[] cols={MediaStore.Audio.Media._ID,MediaStore.Audio.Media.TITLE,MediaStore.Audio.Media.ARTIST,MediaStore.Audio.Media.ALBUM,MediaStore.Audio.Media.ALBUM_ID,MediaStore.Audio.Media.DURATION};
-        try(Cursor c=getContentResolver().query(MediaStore.Audio.Media.EXTERNAL_CONTENT_URI,cols,MediaStore.Audio.Media.IS_MUSIC+" != 0",null,MediaStore.Audio.Media.TITLE+" COLLATE NOCASE ASC")){if(c!=null)while(c.moveToNext()){Song s=new Song();s.id=c.getLong(0);s.title=c.getString(1);s.artist=clean(c.getString(2));s.album=clean(c.getString(3));s.albumId=c.getLong(4);s.duration=c.getLong(5);s.uri=ContentUris.withAppendedId(MediaStore.Audio.Media.EXTERNAL_CONTENT_URI,s.id);songs.add(s);}}catch(Exception e){Toast.makeText(this,"Could not read the music library",Toast.LENGTH_LONG).show();}showLibrary();}
+    private void loadSongs(){
+        final int generation=++libraryGeneration;
+        libraryWorker.execute(()->{
+            android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_BACKGROUND);
+            ArrayList<Song> loaded=new ArrayList<>();boolean failed=false;
+            String[] cols={MediaStore.Audio.Media._ID,MediaStore.Audio.Media.TITLE,MediaStore.Audio.Media.ARTIST,MediaStore.Audio.Media.ALBUM,MediaStore.Audio.Media.ALBUM_ID,MediaStore.Audio.Media.DURATION};
+            try(Cursor c=getContentResolver().query(MediaStore.Audio.Media.EXTERNAL_CONTENT_URI,cols,MediaStore.Audio.Media.IS_MUSIC+" != 0",null,MediaStore.Audio.Media.TITLE+" COLLATE NOCASE ASC")){
+                if(c!=null)while(c.moveToNext()){
+                    Song song=new Song();song.id=c.getLong(0);song.title=c.getString(1);song.artist=clean(c.getString(2));song.album=clean(c.getString(3));song.albumId=c.getLong(4);song.duration=c.getLong(5);song.uri=ContentUris.withAppendedId(MediaStore.Audio.Media.EXTERNAL_CONTENT_URI,song.id);loaded.add(song);
+                }
+            }catch(Exception e){failed=true;android.util.Log.w("CrimsonLibrary","Could not read music library",e);}
+            final boolean error=failed;
+            handler.post(()->{
+                if(isDestroyed()||generation!=libraryGeneration)return;
+                if(error){Toast.makeText(this,"Could not read the music library",Toast.LENGTH_LONG).show();return;}
+                songs.clear();songs.addAll(loaded);
+                if(homeScreen)showLibrary();
+            });
+        });
+    }
     private String clean(String s){return s==null||s.equals("<unknown>")?"Unknown":s;}
     private void showLibrary(){externalQueueOpen=false;eqScreen=false;ampScreen=false;externalScreen=false;releaseExternal();full=false;base();homeScreen=true; LinearLayout header=row();header.setPadding(dp(16),dp(8),dp(16),0);add(header,icon("hamburger",true,this::showMenu,"Menu"),40,48);ImageView brand=new ImageView(this);brand.setImageResource(com.example.akplayer.R.drawable.astell_wordmark);brand.setScaleType(ImageView.ScaleType.FIT_CENTER);brand.setPadding(dp(8),dp(5),dp(8),dp(5));brand.setColorFilter(new android.graphics.ColorMatrixColorFilter(new android.graphics.ColorMatrix(new float[]{0,0,0,0,238, 0,0,0,0,238, 0,0,0,0,239, -3,0,0,0,735})));brand.setContentDescription("Astell and Kern");weighted(header,brand);add(header,icon("search",true,this::showSearch,"Search"),40,48);add(root,header,-1,56);
         LinearLayout title=row();title.setPadding(dp(22),0,dp(22),0);TextView lib=text("LIBRARY",15,MUTED);lib.setLetterSpacing(.16f);weighted(title,lib);add(title,button("↻",32,this::requestLibrary),40,40);add(root,title,-1,48);
@@ -83,12 +120,11 @@ public class MainActivity extends Activity {
     private void songOptions(Song s){String fav=favorites.contains(""+s.id)?"Remove from favorites":"Add to favorites";LinearLayout drawer=drawer(s.title);drawerItem(drawer,fav,()->{toggleFavorite(s);showLibrary();});drawerItem(drawer,"Add to queue",()->{queue.add(s);closeDrawer();Toast.makeText(this,"Added to queue",Toast.LENGTH_SHORT).show();});}
     private void toggleFavorite(Song s){String id=""+s.id;if(!favorites.add(id))favorites.remove(id);getPreferences(0).edit().putStringSet("favorites",new HashSet<>(favorites)).apply();}
     private void playList(List<Song> list,int index){queue.clear();queue.addAll(list);play(index);showPlayer();}
-    private void initializePlayer(){if(player!=null)return;try{player=new MediaPlayer();attachEqualizer();}catch(RuntimeException e){android.util.Log.e("CrimsonEQ","Player initialization failed",e);releaseEqualizer();if(player!=null){player.release();player=null;}}}
+    private void initializePlayer(){if(player!=null)return;try{player=new MediaPlayer();player.setOnSeekCompleteListener(p->{seekPosition.displayedPosition(p.getCurrentPosition(),SystemClock.elapsedRealtime(),SystemClock.elapsedRealtime());updatePlaybackProgress();});}catch(RuntimeException e){android.util.Log.e("CrimsonEQ","Player initialization failed",e);if(player!=null){player.release();player=null;}}}
     private void play(int index){
-        if(queue.isEmpty())return;current=(index+queue.size())%queue.size();initializePlayer();if(player==null){Toast.makeText(this,"Unable to initialize player",Toast.LENGTH_SHORT).show();return;}
+        seekPosition.clear();if(queue.isEmpty())return;current=(index+queue.size())%queue.size();initializePlayer();if(player==null){Toast.makeText(this,"Unable to initialize player",Toast.LENGTH_SHORT).show();return;}
         try{
-            int session=player.getAudioSessionId();playerReady=false;player.reset();player.setAudioAttributes(new android.media.AudioAttributes.Builder().setUsage(android.media.AudioAttributes.USAGE_MEDIA).setContentType(android.media.AudioAttributes.CONTENT_TYPE_MUSIC).build());
-            if(player.getAudioSessionId()!=session){player.setAudioSessionId(session);attachEqualizer();}else if(equalizer==null)attachEqualizer();
+            playerReady=false;player.reset();player.setAudioAttributes(new android.media.AudioAttributes.Builder().setUsage(android.media.AudioAttributes.USAGE_MEDIA).setContentType(android.media.AudioAttributes.CONTENT_TYPE_MUSIC).build());
             player.setDataSource(this,queue.get(current).uri);
             player.setOnPreparedListener(p->{playerReady=true;p.start();if(full)showPlayer();else if(homeScreen)showLibrary();});
             player.setOnCompletionListener(p->{if(repeat)play(current);else if(current+1<queue.size()||shuffle)next();else{p.seekTo(0);if(full)showPlayer();}});
@@ -133,12 +169,12 @@ public class MainActivity extends Activity {
         LinearLayout album=column();album.setGravity(Gravity.CENTER_HORIZONTAL);album.setPadding(dp(36),0,dp(36),0);
         int screenHeight=(int)(getResources().getDisplayMetrics().heightPixels/getResources().getDisplayMetrics().density);
         int side=Math.min(getResources().getDisplayMetrics().widthPixels-dp(72),dp(Math.max(150,Math.min(340,screenHeight-388))));
-        cover.setBackground(shape(0xff303337,0));cover.setScaleType(ImageView.ScaleType.CENTER_CROP);album.addView(cover,new LinearLayout.LayoutParams(side,side));
-        LinearLayout progress=column();progress.setPadding(0,0,0,0);seek=new SeekBar(this);seek.setPadding(0,0,0,0);seek.setThumb(new android.graphics.drawable.ColorDrawable(Color.TRANSPARENT));seek.setProgressTintList(android.content.res.ColorStateList.valueOf(PLAYER_TEXT));seek.setProgressBackgroundTintList(android.content.res.ColorStateList.valueOf(0xff555859));
+        cover.setBackground(shape(0xff303337,0));cover.setScaleType(ImageView.ScaleType.CENTER_CROP);FrameLayout progress=new FrameLayout(this);progress.addView(cover,new FrameLayout.LayoutParams(side,side));
+        seek=new SeekBar(this);seek.setContentDescription("Playback position");seek.setPadding(0,0,0,0);seek.setThumb(new android.graphics.drawable.ColorDrawable(Color.TRANSPARENT));seek.setThumbOffset(0);seek.setProgressTintList(android.content.res.ColorStateList.valueOf(PLAYER_TEXT));seek.setProgressBackgroundTintList(android.content.res.ColorStateList.valueOf(0xff555859));
         long actions=external&&externalController!=null&&externalController.getPlaybackState()!=null?externalController.getPlaybackState().getActions():0;
         seek.setEnabled(!external||(actions&PlaybackState.ACTION_SEEK_TO)!=0);seek.setMax((int)Math.min(Integer.MAX_VALUE,Math.max(0,length)));
-        seek.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener(){public void onStartTrackingTouch(SeekBar b){dragging=true;}public void onStopTrackingTouch(SeekBar b){if(external){if(externalController!=null)externalController.getTransportControls().seekTo(b.getProgress());}else try{if(player!=null&&playerReady)player.seekTo(b.getProgress());}catch(IllegalStateException ignored){}dragging=false;}public void onProgressChanged(SeekBar b,int p,boolean u){if(u&&elapsed!=null)elapsed.setText(time(p));}});
-        add(progress,seek,-1,8);LinearLayout times=row();elapsed=text("0:00",13,0xffb2afa8);duration=text(length>0?time(length):"--:--",13,0xffb2afa8);duration.setGravity(Gravity.RIGHT);weighted(times,elapsed);TextView index=text(external?"":(current+1)+" / "+queue.size(),12,0xffaaa7a0);index.setGravity(Gravity.CENTER);weighted(times,index);weighted(times,duration);add(progress,times,-1,28);album.addView(progress,new LinearLayout.LayoutParams(side,-2));add(root,album,-1,-2);
+        seek.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener(){public void onStartTrackingTouch(SeekBar b){dragging=true;}public void onStopTrackingTouch(SeekBar b){seekPosition.begin(b.getProgress(),SystemClock.elapsedRealtime());try{if(external){if(externalController!=null)externalController.getTransportControls().seekTo(b.getProgress());else seekPosition.clear();}else if(player!=null&&playerReady)player.seekTo(b.getProgress());else seekPosition.clear();}catch(RuntimeException e){seekPosition.clear();}dragging=false;}public void onProgressChanged(SeekBar b,int p,boolean u){if(u&&elapsed!=null)elapsed.setText(time(p));}});
+        FrameLayout.LayoutParams seekBounds=new FrameLayout.LayoutParams(-1,dp(48));seekBounds.topMargin=side-dp(20);progress.addView(seek,seekBounds);LinearLayout times=row();elapsed=text("0:00",13,0xffb2afa8);duration=text(length>0?time(length):"--:--",13,0xffb2afa8);duration.setGravity(Gravity.RIGHT);weighted(times,elapsed);TextView index=text(external?"":(current+1)+" / "+queue.size(),12,0xffaaa7a0);index.setGravity(Gravity.CENTER);weighted(times,index);weighted(times,duration);FrameLayout.LayoutParams timeBounds=new FrameLayout.LayoutParams(-1,dp(28));timeBounds.topMargin=side+dp(8);progress.addView(times,timeBounds);album.addView(progress,new LinearLayout.LayoutParams(side,side+dp(36)));add(root,album,-1,-2);
         View space=new View(this);add(root,space,-1,18);
         LinearLayout tools=row();tools.setPadding(dp(25),0,dp(25),0);
         weighted(tools,icon("expand",!external,()->{if(!external)showLibrary();else openExternalApp();},"Library or source app"));
@@ -149,11 +185,24 @@ public class MainActivity extends Activity {
         weighted(tools,icon("more",true,()->{if(external)openExternalApp();else songOptions(queue.get(current));},"Options"));add(root,tools,-1,48);
         TextView name=text(title==null?"No track information":title,18,PLAYER_TEXT);name.setGravity(Gravity.CENTER);name.setSingleLine();name.setEllipsize(android.text.TextUtils.TruncateAt.END);name.setPadding(dp(20),0,dp(20),0);add(root,name,-1,38);
         TextView by=text(artist==null?"Unknown artist":artist,13,PLAYER_TEXT);by.setTypeface(null,Typeface.BOLD);by.setGravity(Gravity.CENTER);by.setSingleLine();add(root,by,-1,28);
-        LinearLayout controls=row();controls.setPadding(dp(48),0,dp(48),0);weighted(controls,icon("previous",true,back,"Previous track"));weighted(controls,icon(isPlaying?"pause":"play",true,togglePlayback,isPlaying?"Pause":"Play"));weighted(controls,icon("next",true,forward,"Next track"));add(root,controls,-1,90);
+        LinearLayout controls=row();controls.setPadding(dp(48),0,dp(48),0);weighted(controls,icon("previous",true,back,"Previous track"));weighted(controls,icon(isPlaying?"pause":"play",true,togglePlayback,isPlaying?"Pause":"Play"));weighted(controls,icon("next",true,forward,"Next track"));add(root,controls,-1,90);updatePlaybackProgress();
     }
     private void unavailable(){Toast.makeText(this,"This action is managed by the source app",Toast.LENGTH_SHORT).show();}
     private void openExternalApp(){if(externalController==null)return;android.app.PendingIntent intent=externalController.getSessionActivity();try{if(intent!=null)intent.send();else {Intent launch=getPackageManager().getLaunchIntentForPackage(externalController.getPackageName());if(launch!=null)startActivity(launch);else unavailable();}}catch(Exception e){unavailable();}}
-    private final Runnable tick=new Runnable(){public void run(){if(miniController!=null&&miniTitle!=null&&miniToggle!=null){miniTitle.setText(externalTitle());PlaybackState miniState=miniController.getPlaybackState();miniToggle.setIcon(miniState!=null&&miniState.getState()==PlaybackState.STATE_PLAYING?"pause":"play");}if(!dragging&&seek!=null){if(full&&player!=null&&playerReady){try{seek.setMax(player.getDuration());seek.setProgress(player.getCurrentPosition());elapsed.setText(time(player.getCurrentPosition()));duration.setText(time(player.getDuration()));}catch(IllegalStateException ignored){}}else if(externalScreen&&externalController!=null){PlaybackState st=externalController.getPlaybackState();if(st!=null&&st.getPosition()>=0){long pos=st.getPosition();if(st.getState()==PlaybackState.STATE_PLAYING)pos+=(long)((SystemClock.elapsedRealtime()-st.getLastPositionUpdateTime())*st.getPlaybackSpeed());pos=Math.max(0,Math.min(pos,seek.getMax()));seek.setProgress((int)pos);elapsed.setText(time(pos));}}}handler.postDelayed(this,500);}};
+    private void updatePlaybackProgress(){
+        if(dragging||seek==null)return;
+        long now=SystemClock.elapsedRealtime();
+        if(full&&player!=null&&playerReady){
+            try{seek.setMax(player.getDuration());long pos=seekPosition.displayedPosition(player.getCurrentPosition(),now,0);seek.setProgress((int)Math.max(0,Math.min(pos,seek.getMax())));elapsed.setText(time(pos));duration.setText(time(player.getDuration()));}catch(IllegalStateException ignored){}
+        }else if(externalScreen&&externalController!=null){
+            PlaybackState state=externalController.getPlaybackState();
+            if(state!=null&&state.getPosition()>=0){
+                long pos=state.getPosition();if(state.getState()==PlaybackState.STATE_PLAYING)pos+=(long)((now-state.getLastPositionUpdateTime())*state.getPlaybackSpeed());
+                pos=seekPosition.displayedPosition(pos,now,state.getLastPositionUpdateTime());pos=Math.max(0,Math.min(pos,seek.getMax()));seek.setProgress((int)pos);elapsed.setText(time(pos));
+            }
+        }
+    }
+    private final Runnable tick=new Runnable(){public void run(){if(miniController!=null&&miniTitle!=null&&miniToggle!=null){miniTitle.setText(externalTitle());PlaybackState miniState=miniController.getPlaybackState();miniToggle.setIcon(miniState!=null&&miniState.getState()==PlaybackState.STATE_PLAYING?"pause":"play");}updatePlaybackProgress();handler.postDelayed(this,500);}};
     private String time(long ms){long sec=ms/1000;return String.format(Locale.US,"%d:%02d",sec/60,sec%60);}
     private void removeDrawerImmediately(){drawerClosing=false;handler.removeCallbacks(drawerTimeout);externalQueueOpen=false;if(drawerOverlay!=null){drawerOverlay.animate().cancel();if(drawerPanel!=null)drawerPanel.animate().cancel();screen.removeView(drawerOverlay);drawerOverlay=null;drawerPanel=null;}}
     private void closeDrawer(){closeDrawer(null);}
@@ -184,20 +233,23 @@ public class MainActivity extends Activity {
     }
     private void showSearch(){LinearLayout list=drawer("SEARCH");EditText input=new EditText(this);input.setSingleLine();input.setTextColor(WHITE);input.setHintTextColor(MUTED);input.setHint("Song, artist, album");input.setText(query);input.addTextChangedListener(new TextWatcher(){public void beforeTextChanged(CharSequence text,int start,int count,int after){}public void onTextChanged(CharSequence text,int start,int before,int count){resetDrawerTimeout();}public void afterTextChanged(Editable text){}});list.setPadding(dp(20),0,dp(20),0);add(list,input,-1,56);drawerItem(list,"SEARCH",()->{query=input.getText().toString().trim();showLibrary();});drawerItem(list,"CLEAR SEARCH",()->{query="";showLibrary();});}
     private void showMenu(){LinearLayout list=drawer("Astell&Kern");drawerItem(list,"Library",()->{category="SONGS";showLibrary();});drawerItem(list,"Favorites",()->{category="FAVORITES";showLibrary();});drawerItem(list,"Queue",this::showQueue);drawerItem(list,"Playing from other apps",this::showExternal);drawerItem(list,"Equalizer",this::showEqualizer);drawerItem(list,"AMP",this::showAmp);drawerItem(list,"Refresh library",this::requestLibrary);drawerItem(list,"About",()->{LinearLayout about=drawer("ABOUT");TextView info=text("Crimson Player is an independent project inspired by Astell&Kern.",14,MUTED);info.setPadding(dp(24),dp(16),dp(24),0);add(about,info,-1,-2);});}
-    private void releaseEqualizer(){if(equalizer!=null){equalizer.release();equalizer=null;}}
     private String profileId(){return getPreferences(0).getString("eq_profile_selected","default");}
-    private String profileName(String id){return getPreferences(0).getString("eq_profile_name_"+id,"User EQ 01");}
-    private String bandKey(DeviceEqualizer eq,short band){return "eq_profile_"+profileId()+"_gain_"+eq.getCenterFreq(band);}
-    private int savedBand(DeviceEqualizer eq,short band){String key=bandKey(eq,band);android.content.SharedPreferences prefs=getPreferences(0);return prefs.getInt(key,"default".equals(profileId())?prefs.getInt("eq_gain_"+eq.getCenterFreq(band),0):0);}
-    private void applyProfile(){if(equalizer==null)return;short[] range=equalizer.getBandLevelRange();for(short i=0;i<equalizer.getNumberOfBands();i++){int value=savedBand(equalizer,i);equalizer.setBandLevel(i,(short)Math.max(range[0],Math.min(range[1],value)));}}
-    private void showEqProfiles(){LinearLayout list=drawer("EQ PROFILES");Set<String> stored=getPreferences(0).getStringSet("eq_profile_ids",Collections.singleton("default"));ArrayList<String> ids=new ArrayList<>(stored);Collections.sort(ids,(a,b)->profileName(a).compareToIgnoreCase(profileName(b)));for(String id:ids){LinearLayout item=row();item.setPadding(dp(24),0,dp(18),0);TextView label=text(profileName(id),15,WHITE);weighted(item,label);if(id.equals(profileId())){PlayerIcon check=icon("check",true,()->{},"Selected profile");check.setClickable(false);add(item,check,36,44);}item.setOnClickListener(v->closeDrawer(()->{getPreferences(0).edit().putString("eq_profile_selected",id).apply();try{applyProfile();showEqualizer();}catch(RuntimeException e){Toast.makeText(this,"Unable to load EQ profile",Toast.LENGTH_SHORT).show();}}));add(list,item,-1,54);divider(list);}drawerItem(list,"+  Save as new profile",this::saveEqProfile);}
+    private String profileName(String id){return EqPreferences.profileName(getPreferences(0),id);}
+    private String bandKey(DeviceEqualizer eq,short band){return EqPreferences.draftKey(getPreferences(0),eq.getCenterFreq(band));}
+    private void applyProfile(){if(equalizer!=null)EqPreferences.apply(getPreferences(0),equalizer);}
+    private void saveCurrentEqProfile(){
+        if(equalizer==null)return;
+        try{EqPreferences.save(getPreferences(0),equalizer);showEqualizer();Toast.makeText(this,"Saved to "+profileName(profileId()),Toast.LENGTH_SHORT).show();}
+        catch(RuntimeException e){Toast.makeText(this,"Could not save EQ profile",Toast.LENGTH_SHORT).show();}
+    }
+    private void revertEqProfile(){
+        if(equalizer==null)return;
+        try{EqPreferences.revert(getPreferences(0),equalizer);showEqualizer();Toast.makeText(this,"Restored last saved profile",Toast.LENGTH_SHORT).show();}
+        catch(RuntimeException e){Toast.makeText(this,"Could not restore EQ profile",Toast.LENGTH_SHORT).show();}
+    }
+    private void showEqProfiles(){LinearLayout list=drawer("EQ PROFILES");Set<String> stored=EqPreferences.profileIds(getPreferences(0));ArrayList<String> ids=new ArrayList<>(stored);Collections.sort(ids,(a,b)->profileName(a).compareToIgnoreCase(profileName(b)));for(String id:ids){LinearLayout item=row();item.setPadding(dp(24),0,dp(18),0);TextView label=text(profileName(id),15,WHITE);weighted(item,label);if(id.equals(profileId())){PlayerIcon check=icon("check",true,()->{},"Selected profile");check.setClickable(false);add(item,check,36,44);}item.setOnClickListener(v->closeDrawer(()->{getPreferences(0).edit().putString("eq_profile_selected",id).apply();try{applyProfile();showEqualizer();}catch(RuntimeException e){Toast.makeText(this,"Unable to load EQ profile",Toast.LENGTH_SHORT).show();}}));add(list,item,-1,54);divider(list);}drawerItem(list,"+  Save as new profile",this::saveEqProfile);}
     private void saveEqProfile(){LinearLayout list=drawer("SAVE EQ PROFILE");list.setPadding(dp(20),0,dp(20),0);EditText name=new EditText(this);name.setSingleLine();name.setTextColor(WHITE);name.setHintTextColor(MUTED);name.setHint("Profile name");name.addTextChangedListener(new TextWatcher(){public void beforeTextChanged(CharSequence s,int a,int c,int d){}public void onTextChanged(CharSequence s,int a,int b,int c){resetDrawerTimeout();}public void afterTextChanged(Editable e){}});add(list,name,-1,56);drawerItem(list,"SAVE",()->{String label=name.getText().toString().trim();if(label.isEmpty()){Toast.makeText(this,"Enter a profile name",Toast.LENGTH_SHORT).show();saveEqProfile();return;}if(equalizer==null){Toast.makeText(this,"Device EQ is unavailable",Toast.LENGTH_SHORT).show();return;}try{String id=UUID.randomUUID().toString();Set<String> ids=new HashSet<>(getPreferences(0).getStringSet("eq_profile_ids",Collections.singleton("default")));ids.add(id);android.content.SharedPreferences.Editor edit=getPreferences(0).edit().putStringSet("eq_profile_ids",ids).putString("eq_profile_name_"+id,label).putString("eq_profile_selected",id);for(short i=0;i<equalizer.getNumberOfBands();i++)edit.putInt("eq_profile_"+id+"_gain_"+equalizer.getCenterFreq(i),equalizer.getBandLevel(i));edit.apply();showEqualizer();Toast.makeText(this,"EQ profile saved",Toast.LENGTH_SHORT).show();}catch(RuntimeException e){Toast.makeText(this,"Could not save EQ profile",Toast.LENGTH_SHORT).show();}});}
 
-    private void attachEqualizer(){
-        releaseEqualizer();if(player==null)return;
-        try{equalizer=new DeviceEqualizer(player.getAudioSessionId());short[] range=equalizer.getBandLevelRange();for(short b=0;b<equalizer.getNumberOfBands();b++){int value=savedBand(equalizer,b);equalizer.setBandLevel(b,(short)Math.max(range[0],Math.min(range[1],value)));}equalizer.setEnabled(getPreferences(0).getBoolean("eq_enabled",false));}
-        catch(RuntimeException e){releaseEqualizer();android.util.Log.w("CrimsonEQ","Device EQ unavailable",e);}
-    }
     private void sectionHeader(String title,Runnable action){
         LinearLayout header=row();header.setPadding(dp(16),dp(8),dp(16),0);
         add(header,icon("back",true,this::showLibrary,"Back to library"),40,48);
@@ -205,23 +257,26 @@ public class MainActivity extends Activity {
         if(action!=null)add(header,button("↻",32,action),40,48);else add(header,new View(this),40,48);
         add(root,header,-1,56);
     }
+    private String eqStatus(){return equalizer.getNumberOfBands()+" BANDS · "+(!equalizer.hasControl()?"CONTROL LOST":equalizer.getEnabled()?"SYSTEM ON":"OFF")+(EqPreferences.isDirty(getPreferences(0),equalizer)?" · UNSAVED":"");}
     private void resetEqualizer(){if(equalizer==null)return;try{android.content.SharedPreferences.Editor editor=getPreferences(0).edit();for(short b=0;b<equalizer.getNumberOfBands();b++){equalizer.setBandLevel(b,(short)0);editor.putInt(bandKey(equalizer,b),0);}editor.apply();showEqualizer();}catch(RuntimeException e){Toast.makeText(this,"Unable to reset device EQ",Toast.LENGTH_SHORT).show();}}
     private void showEqualizer(){
+        if(eqService!=null&&equalizer==null&&eqService.getEqualizer()==null){eqService.retryEqualizer();equalizer=eqService.getEqualizer();}
         eqScreen=true;ampScreen=false;externalScreen=false;releaseExternal();full=false;base();root.setBackgroundColor(0xff14191d);
         sectionHeader("Equalizer",this::resetEqualizer);
-        if(equalizer==null){LinearLayout message=column();message.setPadding(dp(24),dp(25),dp(24),0);TextView info=text("Play a local track to initialize the device equalizer. The EQ only affects audio played by this app.",15,WHITE);add(message,info,-1,-2);TextView open=button("OPEN FiiO SYSTEM EQ",13,this::openFiioEq);open.setBackground(shape(0xff334c57,4));LinearLayout.LayoutParams p=new LinearLayout.LayoutParams(-1,dp(48));p.topMargin=dp(22);message.addView(open,p);add(root,message,-1,-2);return;}
+        if(equalizer==null){LinearLayout message=column();message.setPadding(dp(24),dp(25),dp(24),0);TextView info=text("System EQ is unavailable or still connecting. This device must support EQ on the Android output mix. Direct/bit-perfect output may bypass it.",15,WHITE);add(message,info,-1,-2);add(message,button("RETRY SYSTEM EQ",13,()->{if(eqService!=null){eqService.retryEqualizer();equalizer=eqService.getEqualizer();}showEqualizer();}),-1,48);TextView open=button("OPEN FiiO SYSTEM EQ",13,this::openFiioEq);open.setBackground(shape(0xff334c57,4));LinearLayout.LayoutParams p=new LinearLayout.LayoutParams(-1,dp(48));p.topMargin=dp(22);message.addView(open,p);add(root,message,-1,-2);return;}
         try{
-            LinearLayout selection=row();selection.setPadding(dp(20),0,dp(18),0);LinearLayout profileArea=column();LinearLayout profileRow=row();TextView profile=text(profileName(profileId()),16,WHITE);weighted(profileRow,profile);add(profileRow,icon("down",true,this::showEqProfiles,"Choose EQ profile"),36,42);add(profileArea,profileRow,-1,44);View underline=new View(this);underline.setBackgroundColor(0xff6195a2);add(profileArea,underline,-1,1);profileArea.setOnClickListener(v->showEqProfiles());weighted(selection,profileArea);Switch enabled=new Switch(this);enabled.setContentDescription("Enable equalizer");enabled.setThumbTintList(new android.content.res.ColorStateList(new int[][]{new int[]{android.R.attr.state_checked},new int[]{}},new int[]{0xffd4eff4,0xffc5cacf}));enabled.setTrackTintList(new android.content.res.ColorStateList(new int[][]{new int[]{android.R.attr.state_checked},new int[]{}},new int[]{0xffff315f,0xff657079}));enabled.setChecked(equalizer.getEnabled());enabled.setOnCheckedChangeListener((button,on)->{try{int result=equalizer.setEnabled(on);if(result!=0||equalizer.getEnabled()!=on){Toast.makeText(this,"Device EQ could not be changed",Toast.LENGTH_SHORT).show();button.setOnCheckedChangeListener(null);button.setChecked(equalizer.getEnabled());return;}getPreferences(0).edit().putBoolean("eq_enabled",on).apply();showEqualizer();}catch(RuntimeException e){Toast.makeText(this,"Device EQ unavailable",Toast.LENGTH_SHORT).show();}});add(selection,enabled,60,48);add(root,selection,-1,58);
+            LinearLayout selection=row();selection.setPadding(dp(20),0,dp(18),0);LinearLayout profileArea=column();LinearLayout profileRow=row();TextView profile=text(profileName(profileId()),16,WHITE);weighted(profileRow,profile);add(profileRow,icon("down",true,this::showEqProfiles,"Choose EQ profile"),36,42);add(profileArea,profileRow,-1,44);View underline=new View(this);underline.setBackgroundColor(0xff6195a2);add(profileArea,underline,-1,1);profileArea.setOnClickListener(v->showEqProfiles());weighted(selection,profileArea);Switch enabled=new Switch(this);enabled.setContentDescription("Enable equalizer");enabled.setThumbTintList(new android.content.res.ColorStateList(new int[][]{new int[]{android.R.attr.state_checked},new int[]{}},new int[]{0xffd4eff4,0xffc5cacf}));enabled.setTrackTintList(new android.content.res.ColorStateList(new int[][]{new int[]{android.R.attr.state_checked},new int[]{}},new int[]{0xffff315f,0xff657079}));enabled.setChecked(equalizer.getEnabled());enabled.setEnabled(equalizer.hasControl());enabled.setOnCheckedChangeListener((button,on)->{try{if(eqService==null)throw new IllegalStateException("System EQ is disconnected");eqService.setEqEnabled(on);if(equalizer.getEnabled()!=on){Toast.makeText(this,"Device EQ could not be changed",Toast.LENGTH_SHORT).show();button.setOnCheckedChangeListener(null);button.setChecked(equalizer.getEnabled());return;}showEqualizer();}catch(RuntimeException e){Toast.makeText(this,"System EQ could not be changed",Toast.LENGTH_SHORT).show();showEqualizer();}});add(selection,enabled,60,48);add(root,selection,-1,58);
             LinearLayout tabs=row();tabs.setPadding(dp(4),dp(3),dp(4),dp(3));tabs.setBackground(shape(0xff31424a,5));TextView main=button("Main",14,()->{});main.setTypeface(null,Typeface.BOLD);main.setBackground(shape(0xff568496,4));weighted(tabs,main);TextView advanced=button("Advanced",14,()->Toast.makeText(this,"Q and parametric controls are not available on this EQ",Toast.LENGTH_LONG).show());advanced.setTextColor(0xffa8c2cc);weighted(tabs,advanced);LinearLayout wrap=column();wrap.setPadding(dp(20),0,dp(20),0);add(wrap,tabs,-1,40);add(root,wrap,-1,40);
-            short[] range=equalizer.getBandLevelRange();boolean active=equalizer.getEnabled()&&equalizer.hasControl();boolean adjustable=equalizer.hasControl();
+            short[] range=equalizer.getBandLevelRange();boolean adjustable=equalizer.hasControl();
+            TextView note=text(eqStatus(),11,MUTED);note.setGravity(Gravity.CENTER);
             TextView selectedGain=text("GAIN    0.0 dB",15,WHITE);TextView selectedFreq=text("FREQ    — Hz",15,WHITE);
             HorizontalScrollView scroll=new HorizontalScrollView(this);scroll.setFillViewport(true);scroll.setHorizontalScrollBarEnabled(false);LinearLayout bands=row();bands.setGravity(Gravity.CENTER);bands.setPadding(dp(18),0,dp(18),0);
-            for(short i=0;i<equalizer.getNumberOfBands();i++){final short band=i;int freq=equalizer.getCenterFreq(i)/1000;short gain=equalizer.getBandLevel(i);if(i==0){selectedGain.setText(String.format(Locale.US,"GAIN    %.1f dB",gain/100f));selectedFreq.setText("FREQ    "+freq+" Hz");}EqBandView v=new EqBandView(this,freq,range[0],range[1],gain,adjustable,value->{if(equalizer==null)return value;try{equalizer.setBandLevel(band,value);short actual=equalizer.getBandLevel(band);getPreferences(0).edit().putInt(bandKey(equalizer,band),actual).apply();selectedGain.setText(String.format(Locale.US,"GAIN    %.1f dB",actual/100f));selectedFreq.setText("FREQ    "+freq+" Hz");return actual;}catch(RuntimeException e){Toast.makeText(this,"Unable to adjust EQ band",Toast.LENGTH_SHORT).show();return value;}});int width=Math.max(36,(int)(getResources().getDisplayMetrics().widthPixels/getResources().getDisplayMetrics().density-36)/equalizer.getNumberOfBands());add(bands,v,width,-1);}
+            for(short i=0;i<equalizer.getNumberOfBands();i++){final short band=i;int freq=equalizer.getCenterFreq(i)/1000;short gain=equalizer.getBandLevel(i);if(i==0){selectedGain.setText(String.format(Locale.US,"GAIN    %.1f dB",gain/100f));selectedFreq.setText("FREQ    "+freq+" Hz");}EqBandView v=new EqBandView(this,freq,range[0],range[1],gain,adjustable,value->{if(equalizer==null)return value;try{equalizer.setBandLevel(band,value);short actual=equalizer.getBandLevel(band);getPreferences(0).edit().putInt(bandKey(equalizer,band),actual).apply();selectedGain.setText(String.format(Locale.US,"GAIN    %.1f dB",actual/100f));selectedFreq.setText("FREQ    "+freq+" Hz");note.setText(eqStatus());return actual;}catch(RuntimeException e){Toast.makeText(this,"Unable to adjust EQ band",Toast.LENGTH_SHORT).show();return value;}});int width=Math.max(36,(int)(getResources().getDisplayMetrics().widthPixels/getResources().getDisplayMetrics().density-36)/equalizer.getNumberOfBands());add(bands,v,width,-1);}
             scroll.addView(bands);root.addView(scroll,new LinearLayout.LayoutParams(-1,0,1));divider(root);
             LinearLayout details=column();details.setPadding(dp(24),0,dp(24),0);add(details,selectedGain,-1,38);divider(details);add(details,selectedFreq,-1,38);add(root,details,-1,77);
-            TextView note=text(String.format(Locale.US,"%d BANDS  ·  %.1f TO %.1f dB  ·  %s",equalizer.getNumberOfBands(),range[0]/100f,range[1]/100f,active?"ON":"OFF"),11,MUTED);note.setGravity(Gravity.CENTER);add(root,note,-1,30);
-            LinearLayout footer=row();weighted(footer,button("SAVE AS",12,this::saveEqProfile));weighted(footer,button("FiiO SYSTEM EQ",12,this::openFiioEq));add(root,footer,-1,42);
-        }catch(RuntimeException e){Toast.makeText(this,"Device EQ unavailable",Toast.LENGTH_LONG).show();releaseEqualizer();showEqualizer();}
+            add(root,note,-1,30);
+            LinearLayout footer=row();weighted(footer,button("SAVE",12,this::saveCurrentEqProfile));weighted(footer,button("REVERT",12,this::revertEqProfile));weighted(footer,button("SAVE AS",12,this::saveEqProfile));add(root,footer,-1,42);
+        }catch(RuntimeException e){Toast.makeText(this,"Device EQ unavailable",Toast.LENGTH_LONG).show();equalizer=null;showEqualizer();}
     }
     private void openFiioEq(){Intent intent=getPackageManager().getLaunchIntentForPackage("com.fiio.fiioeq");try{if(intent!=null)startActivity(intent);else startActivity(new Intent(Settings.ACTION_SOUND_SETTINGS));}catch(Exception e){Toast.makeText(this,"FiiO EQ is unavailable",Toast.LENGTH_LONG).show();}}
     private void showAmp(){
@@ -241,7 +296,7 @@ public class MainActivity extends Activity {
         TextView note=text("The current gain level is shown in FiiO settings. Super and tube modes are not available on M11S.",12,0xff91a6ae);note.setPadding(dp(4),dp(14),dp(4),0);add(content,note,-1,-2);
     }
     private void openAmpSettings(){try{startActivity(new Intent(Settings.ACTION_SOUND_SETTINGS));}catch(Exception e){Toast.makeText(this,"Could not open device audio settings",Toast.LENGTH_LONG).show();}}
-    private void releaseExternal(){if(externalController!=null){externalController.unregisterCallback(externalCallback);externalController=null;}}
+    private void releaseExternal(){if(externalController!=null){seekPosition.clear();externalController.unregisterCallback(externalCallback);externalController=null;}}
     private void showExternal(){
         externalScreen=true;full=false;releaseExternal();
         ComponentName listener=new ComponentName(this,MediaNotificationListener.class);
@@ -271,7 +326,8 @@ public class MainActivity extends Activity {
             ()->{if(externalController!=null)externalController.getTransportControls().skipToNext();},this::showExternalQueue);
         if(externalQueueOpen)showExternalQueue();
     }
-    @Override protected void onResume(){super.onResume();if(externalScreen)showExternal();else if(homeScreen)showLibrary();}
+    @Override protected void onResume(){super.onResume();if(eqService!=null)equalizer=eqService.getEqualizer();if(eqScreen)showEqualizer();else if(externalScreen)showExternal();else if(homeScreen&&resumedOnce)showLibrary();resumedOnce=true;}
     @Override public void onBackPressed(){if(drawerOverlay!=null)closeDrawer();else if(full||externalScreen||ampScreen||eqScreen)showLibrary();else super.onBackPressed();}
-    @Override protected void onDestroy(){handler.removeCallbacks(drawerTimeout);handler.removeCallbacks(tick);releaseExternal();releaseEqualizer();if(player!=null)player.release();super.onDestroy();}
+    @Override protected void onNewIntent(Intent intent){super.onNewIntent(intent);setIntent(intent);if(SystemEqualizerService.SHOW_EQ.equals(intent.getAction()))showEqualizer();}
+    @Override protected void onDestroy(){libraryGeneration++;libraryWorker.shutdownNow();handler.removeCallbacks(drawerTimeout);handler.removeCallbacks(tick);releaseExternal();if(eqBound){unbindService(eqConnection);eqBound=false;}equalizer=null;eqService=null;if(player!=null)player.release();super.onDestroy();}
 }
